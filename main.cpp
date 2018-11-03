@@ -2,14 +2,21 @@
 #include <string.h>
 #include <stdlib.h>
 #include "MatC.h"
-#include "cmn.h"
 
 // USER LEVEL
 enum SOLVE_METHOD {
 	EKF,
 	SLSQ,
 };
+enum USING_OBS {
+	CODE_ONLY,
+	CODE_PHASE,
+	PHASE_ONLY,
+};
 const SOLVE_METHOD METHOD = EKF;
+USING_OBS USING = CODE_PHASE;
+#define REF_PRN 17
+
 
 // PROGRAM LEVEL
 #define OBS_FILE "RemoteL1L2.obs"  
@@ -23,7 +30,7 @@ const double station_xyz[3]{ -1633489.41308729 , -3651627.19449714, 4952481.5998
 const double base_xyz[3]{ -1625352.17084393, -3653483.75114927, 4953733.86925805 };
 
 // OBSERVATION EVENTS
-#define SAT_EVENT unsigned char
+#define SAT_EVENT   unsigned char
 #define SAT_LOW        0b00000001
 #define SAT_OUT        0b00000010
 #define SAT_IN         0b00000100
@@ -42,8 +49,11 @@ const double base_xyz[3]{ -1625352.17084393, -3653483.75114927, 4953733.86925805
 #define OUTLIER_THRES 20 // meters
 
 // ESTIMATOR PARAMETERS
-#define OBS_SIGMA0 1
-#define SLSQ_SYS_NOI 0.5
+#define CODE_SIGMA0 1
+#define PHASE_SIGMA0 0.1
+// SLSQ
+#define SLSQ_SYS_NOI 0.1
+// EKF
 #define EKF_SYS_NOI 0.1
 #define FIRST_OBS_NOI 6e6
 #define EKF_INTERVAL 1
@@ -54,6 +64,7 @@ const double base_xyz[3]{ -1625352.17084393, -3653483.75114927, 4953733.86925805
 
 struct node {
 	int epoch;
+	int sat_num;
 	SAT_EVENT ev;
 	node * next;
 };
@@ -61,6 +72,7 @@ struct node {
 struct perfect_segment {
 	int start_time;
 	int last_for;
+	int sn;
 };
 
 struct obs_epoch {
@@ -86,11 +98,9 @@ struct gnss_ekf
 	Matrix * Dx;
 	Matrix * Dp;
 	Matrix * F;
-	Matrix * T;
 
 	Matrix * Ft;
-	Matrix * Tt;
-	Matrix * De;
+	Matrix * Q;
 
 	Matrix * Z;
 	Matrix * H;
@@ -99,7 +109,41 @@ struct gnss_ekf
 
 	Matrix * K;
 	Matrix * V;
+	Matrix * I;
 };
+
+double distance(const double * p1, const double * p2, int dim = 3)
+{
+	double tot = 0;
+	for (int i = 0; i < dim; i++)
+	{
+		tot += (p1[i] - p2[i]) * (p1[i] - p2[i]);
+	}
+	return sqrt(tot);
+}
+
+double elev(const double * sat_pos, const double * user_pos)
+{
+
+	double dpos[3] = { 0 };
+	double ori[3]{ 0,0,0 };
+	dpos[0] = sat_pos[0] - user_pos[0];
+	dpos[1] = sat_pos[1] - user_pos[1];
+	dpos[2] = sat_pos[2] - user_pos[2];
+
+	double user_distance_to_earth = distance(user_pos, ori);
+
+	double mod = sqrt(dpos[0] * dpos[0] + dpos[1] * dpos[1] + dpos[2] * dpos[2]);
+	if (fabs(user_distance_to_earth * mod < 1.0)) {
+		return M_PI_2;
+	}
+	else {
+		double m = dpos[0] * user_pos[0] + dpos[1] * user_pos[1] + dpos[2] * user_pos[2];
+		double n = m / (mod * user_distance_to_earth);
+		return M_PI_2 - acos(n);
+	}
+}
+
 
 obs_epoch OBS[CHANNEL_NUM];
 sat_epoch SAT[CHANNEL_NUM];
@@ -138,10 +182,14 @@ SAT_EVENT ev;
 double sat_elev[GPS_SAT_NUM];
 perfect_segment sigment;
 double solution[3] = { 0,0,0 };
+//double solution[3] = { -1633489.41308729 , -3651627.19449714, 4952481.59981920 };
+
+double ambiguity[GPS_SAT_NUM] = {0};
 // DOUBLE-DIFFER
 int ref_sat = 0;
 double ref_ele = 0;
 Matrix * D = NULL;
+int prn_table[GPS_SAT_NUM];
 // SLSQ
 Matrix * Q = NULL;
 // EKF
@@ -151,11 +199,12 @@ gnss_ekf ekf;
 double phase_rate_value_1[GPS_SAT_NUM];
 double phase_rate_value_2[GPS_SAT_NUM];
 
-void append_history(SAT_EVENT e)
+void append_history(SAT_EVENT e, int sn)
 {
 	node * next = new node();
 	next->epoch = current_time;
 	next->ev = e;
+	next->sat_num = sn;
 	next->next = NULL;
 	current->next = next;
 	current = current->next;
@@ -174,48 +223,34 @@ inline double cycle_slip_2(obs_epoch * current, obs_epoch * last)
 	return fabs((current->L1 - last->L1)* LAMBDA_1 - (current->L2 - last->L2) * LAMBDA_2);
 }
 
-void ekf_create(double DeltaT)
+void ekf_create(double DeltaT, int sat_num)
 {
 	double ttd2 = 0.5 * DeltaT * DeltaT;
 	double tttd6 = DeltaT * DeltaT * DeltaT / 6;
-	ekf.X = malloc_mat(9, 1);
-	ekf.Xp = malloc_mat(9, 1);
-	ekf.Dx = eyes(9, FIRST_OBS_NOI);
-	ekf.Dp = eyes(9);
+	int num_state = 2 + sat_num;
+	ekf.X = malloc_mat(num_state, 1);
+	ekf.X->data[0][0] = station_xyz[0];
+	ekf.X->data[1][0] = station_xyz[1];
+	ekf.X->data[2][0] = station_xyz[2];
+
+
+	ekf.Xp = malloc_mat(num_state, 1);
+	ekf.Dx = eyes(num_state, FIRST_OBS_NOI);
+	ekf.Dp = eyes(num_state);
+	ekf.I = eyes(num_state);
 
 	ekf.Z = NULL;
 	ekf.Dz = NULL;
 	ekf.H = NULL;
 	ekf.Ft = NULL;
-	ekf.Tt = NULL;
 	ekf.K = NULL;
 	ekf.V = NULL;
 	ekf.Zp = NULL;
 
-	ekf.F = malloc_mat(9, 9);
-	for (int i = 0; i < 3; i++)
-	{
-		int offset = i * 3;
-		ekf.F->data[offset][offset] = 1;
-		ekf.F->data[offset][offset + 1] = DeltaT;
-		ekf.F->data[offset][offset + 2] = ttd2;
-		ekf.F->data[offset + 1][offset + 1] = 1;
-		ekf.F->data[offset + 1][offset + 2] = DeltaT;
-		ekf.F->data[offset + 2][offset + 2] = 1;
-	}
-
-	ekf.T = malloc_mat(9, 3);
-	for (int i = 0; i < 3; i++)
-	{
-		ekf.T->data[3 * i][i] = tttd6;
-		ekf.T->data[3 * i + 1][i] = ttd2;
-		ekf.T->data[3 * i + 2][i] = DeltaT;
-	}
-
-	ekf.De = eyes(3, EKF_SYS_NOI);
+	ekf.F = eyes(num_state);
+	ekf.Q = eyes(num_state, EKF_SYS_NOI);
 
 	mat_trans(ekf.F, ekf.Ft);
-	mat_trans(ekf.T, ekf.Tt);
 }
 
 void ekf_predict()
@@ -224,9 +259,7 @@ void ekf_predict()
 	Matrix * temp1 = NULL, *temp2 = NULL, *temp3 = NULL, *temp4 = NULL;
 	mat_multiply(ekf.F, ekf.Dx, temp1);
 	mat_multiply(temp1, ekf.Ft, temp2);
-	mat_multiply(ekf.T, ekf.De, temp3);
-	mat_multiply(temp3, ekf.Tt, temp4);
-	mat_sum(temp2, temp4, ekf.Dp);
+	mat_sum(temp2, ekf.Q, ekf.Dp);
 
 	free_mat(temp1);
 	free_mat(temp2);
@@ -241,15 +274,15 @@ void ekf_fetch_observation()
 	free_mat(ekf.Dz);
 	free_mat(ekf.Zp);
 
-	ekf.H = malloc_mat(sat_num, 9);
-	ekf.Z = malloc_mat(sat_num, 1);
-	ekf.Dz = malloc_mat(sat_num, sat_num);
-	ekf.Zp = malloc_mat(sat_num, 1);
+	ekf.H = malloc_mat(sat_num * 2, 2 + sat_num);
+	ekf.Z = malloc_mat(sat_num * 2, 1);
+	ekf.Dz = malloc_mat(sat_num * 2, sat_num * 2);
+	ekf.Zp = malloc_mat(sat_num * 2, 1);
 
 	double x[3] = {
 		ekf.Xp->data[0][0],
-		ekf.Xp->data[3][0],
-		ekf.Xp->data[6][0]
+		ekf.Xp->data[1][0],
+		ekf.Xp->data[2][0]
 	};
 
 	double * DX0 = (double*)alloca(sat_num * sizeof(double));
@@ -269,15 +302,26 @@ void ekf_fetch_observation()
 	}
 	for (int j = 0; j < sat_num; j++)
 	{
+		int i_c = j * 2;     // code
+		int i_p = j * 2 + 1; // phase
+
 		double sinE = sin(sat_elev[(int)(S_SAT[j]->PRN - 1)]);
-		ekf.Z->data[j][0] = S_OBS[j]->C1 - S_STA[j]->C1 + S2[j];
-		ekf.Dz->data[j][j] = OBS_SIGMA0 * OBS_SIGMA0 / sinE / sinE;
+		ekf.Dz->data[i_c][i_c] = CODE_SIGMA0 * CODE_SIGMA0 / sinE / sinE;
+		ekf.Dz->data[i_p][i_p] = PHASE_SIGMA0 * PHASE_SIGMA0 / sinE / sinE;
 
-		ekf.H->data[j][0] = -DX0[j] / S[j];
-		ekf.H->data[j][3] = -DY0[j] / S[j];
-		ekf.H->data[j][6] = -DZ0[j] / S[j];
+		ekf.Z->data[i_c][0] = S_OBS[j]->C1 - S_STA[j]->C1 + S2[j];
+		ekf.Z->data[i_p][0] = S_OBS[j]->L1 * LAMBDA_1 - S_STA[j]->L1 * LAMBDA_1 + S2[j];
 
-		ekf.Zp->data[j][0] = S[j];
+		ekf.H->data[i_c][0] = -DX0[j] / S[j];
+		ekf.H->data[i_c][1] = -DY0[j] / S[j];
+		ekf.H->data[i_c][2] = -DZ0[j] / S[j];
+
+		ekf.H->data[i_p][0] = -DX0[j] / S[j];
+		ekf.H->data[i_p][1] = -DY0[j] / S[j];
+		ekf.H->data[i_p][2] = -DZ0[j] / S[j];
+
+		ekf.Zp->data[i_c][0] = S[j];
+		ekf.Zp->data[i_p][0] = S[j];
 	}
 
 	Matrix * La = ekf.Z;
@@ -303,6 +347,13 @@ void ekf_fetch_observation()
 	free_mat(Cla);
 	free_mat(temp);
 	free_mat(Dt);
+
+	for (int i = 0; i < sat_num - 1; i++)
+	{
+		int i_p = i * 2 + 1; // phase
+		ekf.H->data[i_p][i + 3] = LAMBDA_1;
+		ekf.Zp->data[i_p][0] += ekf.Xp->data[i + 3][0] * LAMBDA_1;
+	}
 }
 
 void ekf_execute()
@@ -328,8 +379,7 @@ void ekf_execute()
 
 	//Covariance Matrix
 	mat_multiply(ekf.K, ekf.H, temp2);
-	Matrix * I = eyes(9);
-	mat_minus(I, temp2, temp3);
+	mat_minus(ekf.I, temp2, temp3);
 	mat_multiply(temp3, ekf.Dp, ekf.Dx);
 
 	free_mat(temp1); free_mat(temp2); free_mat(temp3);
@@ -343,8 +393,10 @@ bool ekf_solve()
 	ekf_execute();
 
 	solution[0] = ekf.X->data[0][0];
-	solution[1] = ekf.X->data[3][0];
-	solution[2] = ekf.X->data[6][0];
+	solution[1] = ekf.X->data[1][0];
+	solution[2] = ekf.X->data[2][0];
+	for (int i = 0; i < sat_num - 1; i++)
+		ambiguity[prn_table[i] - 1] = ekf.X->data[i + 3][0];
 	
 	return true;
 }
@@ -422,6 +474,7 @@ void overall_reset()
 	memset(phase_rate_value_1, 0, sizeof(double) * GPS_SAT_NUM);
 	memset(phase_rate_value_2, 0, sizeof(double) * GPS_SAT_NUM);
 	memset(sat_elev, 0, sizeof(double) * GPS_SAT_NUM);
+	memset(prn_table, 0, sizeof(int) * GPS_SAT_NUM);
 
 	memcpy(P_OBS, OBS, sizeof(obs_epoch) * CHANNEL_NUM);
 	memcpy(P_SAT, SAT, sizeof(sat_epoch) * CHANNEL_NUM);
@@ -533,6 +586,7 @@ bool find_perfect_sigment()
 				if (sigment.last_for < j->epoch - 1 - i->epoch) {
 					sigment.start_time = i->epoch;
 					sigment.last_for = j->epoch - 1 - i->epoch;
+					sigment.sn = i->sat_num;
 				}
 				i = j->next;
 				
@@ -544,38 +598,101 @@ bool find_perfect_sigment()
 	return true;
 }
 
-void fetch_ref_sat()
+void fetch_ref_sat(int prn = 0)
 {
-	ref_sat = 0;
-	ref_ele = sat_elev[0];
+	if (prn <= 0) {
+		ref_sat = 0;
+		ref_ele = sat_elev[0];
 
-	for (int i = 1; i < sat_num; i++)
-	{
-		if (ref_ele < sat_elev[(int)(S_SAT[i]->PRN)])
+		for (int i = 1; i < sat_num; i++)
 		{
-			ref_ele = sat_elev[(int)(S_SAT[i]->PRN)];
-			ref_sat = i;
+			if (ref_ele < sat_elev[(int)(S_SAT[i]->PRN) - 1])
+			{
+				ref_ele = sat_elev[(int)(S_SAT[i]->PRN) - 1];
+				ref_sat = i;
+			}
 		}
 	}
+	else
+	{
+		for (int i = 0; i < sat_num; i++)
+		{
+			if (S_SAT[i]->PRN == prn)
+			{
+				ref_sat = i;
+				ref_ele = sat_elev[prn - 1];
+				goto next;
+			}
+		}
 
-	D = malloc_mat(sat_num - 1, sat_num);
+	}
+	throw - 1;
+next:;
+
 	for (int i = 0; i < sat_num - 1; i++)
 	{
-		D->data[i][i + (i >= ref_sat ? 1 : 0)] = 1;
-		D->data[i][ref_sat] = -1;
+		prn_table[i] = (int)S_SAT[i + (i >= ref_sat ? 1 : 0)]->PRN;
+	}
+	int row = 0, col = 0;
+	switch (USING) {
+	case CODE_ONLY:
+		row = sat_num - 1;
+		col = sat_num;
+		D = malloc_mat(row, col);
+		for (int i = 0; i < row; i++)
+		{
+			D->data[i][i + (i >= ref_sat ? 1 : 0)] = 1;
+			D->data[i][ref_sat] = -1;
+		}
+		break;
+	case CODE_PHASE:
+		row = 2 * sat_num - 2;
+		col = 2 * sat_num;
+		D = malloc_mat(row, col);
+		for (int i = 0; i < row; i += 2)
+		{
+			D->data[i][i + (i >= ref_sat * 2 ? 2 : 0)] = 1;
+			D->data[i + 1][i + (i >= ref_sat * 2 ? 3 : 1)] = 1;
+			D->data[i][ref_sat * 2] = -1;
+			D->data[i + 1][ref_sat * 2 + 1] = -1;
+		}
+		break;
+	default:
+		throw "under construction";
 	}
 }
 
 bool slsq_solve()
 {
-	Matrix * L = malloc_mat(sat_num, 1);
-	Matrix * A = malloc_mat(sat_num, 3);
-	Matrix * Cl = malloc_mat(sat_num, sat_num);
-	Matrix * r = malloc_mat(sat_num, 1);
-	Matrix * δ = malloc_mat(3, 1);
-	Matrix * Cx = malloc_mat(3, 3);
 
+	Matrix * L = NULL;
+	Matrix * A = NULL;
+	Matrix * Cl = NULL;
+	Matrix * r = NULL;
+	Matrix * δ = NULL;
+	Matrix * Cx = NULL;
 
+	switch (USING)
+	{
+	case CODE_ONLY:
+		L = malloc_mat(sat_num, 1);
+		A = malloc_mat(sat_num, 3);
+		Cl = malloc_mat(sat_num, sat_num);
+		r = malloc_mat(sat_num, 1);
+		δ = malloc_mat(3, 1);
+		Cx = malloc_mat(3, 3);
+		break;
+	case CODE_PHASE:
+		L = malloc_mat(sat_num * 2, 1);
+		A = malloc_mat(sat_num * 2, sat_num + 2);
+		Cl = malloc_mat(sat_num * 2, sat_num * 2);
+		r = malloc_mat(sat_num * 2, 1);
+		δ = malloc_mat(sat_num + 2, 1);
+		Cx = malloc_mat(sat_num + 2, sat_num + 2);
+		break;
+	default:
+		throw "under construction";
+	}
 
 	double * DX0 = (double*)alloca(sat_num * sizeof(double));
 	double * DY0 = (double*)alloca(sat_num * sizeof(double));
@@ -583,11 +700,9 @@ bool slsq_solve()
 	double * S = (double*)alloca(sat_num * sizeof(double)); 
 	double * S2 = (double*)alloca(sat_num * sizeof(double)); 
 
-	double last_solution[4] = { 0,0,0,0 };
 
 	//for (int i = 0; i < LS_MAX_ITER; i++) 
 	{
-		memcpy(last_solution, solution, sizeof(double) * 4); 
 		for (int j = 0; j < sat_num; j++)
 		{
 			DX0[j] = S_SAT[j]->P[0] - solution[0];
@@ -598,16 +713,38 @@ bool slsq_solve()
 			S2[j] = distance(base_xyz, S_SAT[j]->P);
 		}
 
-		for (int j = 0; j < sat_num; j++)
-		{
-			double sinE = sin(sat_elev[(int)(S_SAT[j]->PRN - 1)]);
-			Cl->data[j][j] = 1;//OBS_SIGMA0 * OBS_SIGMA0 / sinE;
+		if(USING == CODE_PHASE)
+			for (int j = 0; j < sat_num; j++)
+			{
+				int i_c = j * 2;     // code
+				int i_p = j * 2 + 1; // phase
 
-			L->data[j][0] = S_OBS[j]->C1 - S_STA[j]->C1 + S2[j] - S[j] - solution[3];
+				double sinE = sin(sat_elev[(int)(S_SAT[j]->PRN - 1)]);
+				Cl->data[i_c][i_c] = CODE_SIGMA0 * CODE_SIGMA0 / sinE / sinE;
+				Cl->data[i_p][i_p] = PHASE_SIGMA0 * PHASE_SIGMA0 / sinE / sinE;
 
-			A->data[j][0] = -DX0[j] / S[j];
-			A->data[j][1] = -DY0[j] / S[j]; 
-			A->data[j][2] = -DZ0[j] / S[j];       
+				L->data[i_c][0] = S_OBS[j]->C1 - S_STA[j]->C1 + S2[j] - S[j];
+				L->data[i_p][0] = S_OBS[j]->L1 * LAMBDA_1 - S_STA[j]->L1 * LAMBDA_1 + S2[j] - S[j];
+
+				A->data[i_c][0] = -DX0[j] / S[j];
+				A->data[i_c][1] = -DY0[j] / S[j];
+				A->data[i_c][2] = -DZ0[j] / S[j];
+
+				A->data[i_p][0] = -DX0[j] / S[j];
+				A->data[i_p][1] = -DY0[j] / S[j];
+				A->data[i_p][2] = -DZ0[j] / S[j];
+				//A->data[i_p][j + 3] = LAMBDA_1;
+			}
+		else {
+			for (int j = 0; j < sat_num; j++)
+			{
+				double sinE = sin(sat_elev[(int)(S_SAT[j]->PRN - 1)]);
+				Cl->data[j][j] = CODE_SIGMA0 * CODE_SIGMA0 / sinE / sinE;
+				L->data[j][0] = S_OBS[j]->C1 - S_STA[j]->C1 + S2[j] - S[j];
+				A->data[j][0] = -DX0[j] / S[j];
+				A->data[j][1] = -DY0[j] / S[j];
+				A->data[j][2] = -DZ0[j] / S[j];
+			}
 		}
 
 
@@ -632,20 +769,28 @@ bool slsq_solve()
 		free_mat(temp);
 		free_mat(Dt);
 
+		if (USING == CODE_PHASE)
+			for (int i = 0; i < sat_num - 1; i++)
+			{
+				int i_p = i * 2 + 1; // phase
+				A->data[i_p][i + 3] = LAMBDA_1;
+				L->data[i_p][0] -= ambiguity[prn_table[i] - 1] * LAMBDA_1;
+			}
+
 		SLS(L, A, Cl, δ, Q);
 
+		if (USING == CODE_PHASE)
+			for (int j = 0; j < sat_num - 1; j++)
+			{
+				ambiguity[prn_table[j] - 1] += δ->data[j + 3][0];
+				Q->data[j + 3][j + 3] += SLSQ_SYS_NOI;
+			}
+
 		for (int j = 0; j < 3; j++) {
-			solution[j] += δ->data[j][0];
+			solution[j] = solution[j] + δ->data[j][0];
 			Q->data[j][j] += SLSQ_SYS_NOI;
 		}
-
-		free_mat(A);
-		free_mat(L);
-		free_mat(Cl);
-		L = malloc_mat(sat_num, 1);
-		A = malloc_mat(sat_num, 4);
-		Cl = malloc_mat(sat_num, sat_num);
-
+		//mat_output(Q, "Q");
 	}
 	free_mat(L); free_mat(A); free_mat(Cl);
 	free_mat(r); free_mat(δ);
@@ -688,7 +833,7 @@ void check_observation()
 		inverse_phase(OBS);
 		inverse_phase(STA);
 		overall_check();
-		append_history(ev);
+		append_history(ev, sat_num);
 
 		output_1();
 
@@ -704,7 +849,8 @@ void solve()
 	nfp = fopen(SAT_FILE, "rb");
 	sfp = fopen(STA_FILE, "rb");
 	if (METHOD == EKF)
-		ekf_create(EKF_INTERVAL);
+		ekf_create(EKF_INTERVAL, sigment.sn);
+	
 
 	while (!feof(ofp) && !feof(nfp) && !feof(sfp))
 	{
@@ -718,12 +864,11 @@ void solve()
 
 		if (OBS->Time >= sigment.start_time && OBS->Time <= sigment.last_for + sigment.start_time)
 		{
-			fetch_ref_sat();
+			fetch_ref_sat(REF_PRN);
 			if (METHOD == SLSQ)
 				slsq_solve();
 			else if (METHOD == EKF)
 				ekf_solve();
-
 			output_2();
 		}
 		overall_reset();
@@ -734,6 +879,8 @@ void solve()
 
 int main()
 {
+	if (USING == CODE_ONLY && METHOD == EKF) return 0;
+
 	check_observation();
 
 	outfp = fopen("out.txt", "w");
