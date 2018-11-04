@@ -13,7 +13,7 @@ enum USING_OBS {
 	CODE_PHASE,
 	PHASE_ONLY,
 };
-const SOLVE_METHOD METHOD = EKF;
+const SOLVE_METHOD METHOD = SLSQ;
 USING_OBS USING = CODE_PHASE;
 #define REF_PRN 17
 
@@ -50,13 +50,19 @@ const double base_xyz[3]{ -1625352.17084393, -3653483.75114927, 4953733.86925805
 
 // ESTIMATOR PARAMETERS
 #define CODE_SIGMA0 1
-#define PHASE_SIGMA0 0.1
+#define PHASE_SIGMA0 0.01
 // SLSQ
-#define SLSQ_SYS_NOI 0.1
+#define SLSQ_SYS_NOI 1e-5
 // EKF
 #define EKF_SYS_NOI 0.1
 #define FIRST_OBS_NOI 6e6
 #define EKF_INTERVAL 1
+
+// SOS PARAMETERS
+#define SOS_EDGE 10
+const int SOS_BINS = SOS_EDGE * 2 + 1;
+#define SOS_THRES 3
+#define SOS_VALID_RES 0.50
 
 // GPS LEVEL
 #define LAMBDA_1 0.190293672798365
@@ -111,6 +117,20 @@ struct gnss_ekf
 	Matrix * V;
 	Matrix * I;
 };
+
+void find_min(double * samples, int length, int & index, double & value, int except = -1)
+{
+	int start_index = 0;
+	while (start_index == except) start_index++;
+
+	index = start_index;
+	value = samples[start_index];
+
+	for (int i = start_index + 1; i < length; i++)
+		if (samples[i] < value && i != except) {
+			index = i; value = samples[i];
+		}
+}
 
 double distance(const double * p1, const double * p2, int dim = 3)
 {
@@ -181,8 +201,8 @@ SAT_EVENT ev;
 // SOLUTION LEVEL
 double sat_elev[GPS_SAT_NUM];
 perfect_segment sigment;
-double solution[3] = { 0,0,0 };
-//double solution[3] = { -1633489.41308729 , -3651627.19449714, 4952481.59981920 };
+//double solution[3] = { 0,0,0 };
+double solution[3] = { -1633489.41308729 , -3651627.19449714, 4952481.59981920 };
 
 double ambiguity[GPS_SAT_NUM] = {0};
 // DOUBLE-DIFFER
@@ -194,6 +214,16 @@ int prn_table[GPS_SAT_NUM];
 Matrix * Q = NULL;
 // EKF
 gnss_ekf ekf;
+
+// SOS LEVEL
+double sos_res_mag = 0;
+double sigma_hat = 0;
+double sos_omega[GPS_SAT_NUM][SOS_EDGE * 2 + 1] = { {0} };
+double sos_ratio[GPS_SAT_NUM] = { 0 };
+bool sos_fixed[GPS_SAT_NUM] = { false };
+bool sos_lock_flag = false;
+bool sos_conv_flag = false;
+int sos_center_amb[GPS_SAT_NUM] = { 0 };
 
 // ANALYZE LEVEL
 double phase_rate_value_1[GPS_SAT_NUM];
@@ -705,9 +735,9 @@ bool slsq_solve()
 	{
 		for (int j = 0; j < sat_num; j++)
 		{
-			DX0[j] = S_SAT[j]->P[0] - solution[0];
-			DY0[j] = S_SAT[j]->P[1] - solution[1];
-			DZ0[j] = S_SAT[j]->P[2] - solution[2];
+			DX0[j] = S_SAT[j]->P[0] - station_xyz[0];
+			DY0[j] = S_SAT[j]->P[1] - station_xyz[1];
+			DZ0[j] = S_SAT[j]->P[2] - station_xyz[2];
 			S[j] = sqrt(DX0[j] * DX0[j] + DY0[j] * DY0[j] + DZ0[j] * DZ0[j]);
 
 			S2[j] = distance(base_xyz, S_SAT[j]->P);
@@ -724,7 +754,7 @@ bool slsq_solve()
 				Cl->data[i_p][i_p] = PHASE_SIGMA0 * PHASE_SIGMA0 / sinE / sinE;
 
 				L->data[i_c][0] = S_OBS[j]->C1 - S_STA[j]->C1 + S2[j] - S[j];
-				L->data[i_p][0] = S_OBS[j]->L1 * LAMBDA_1 - S_STA[j]->L1 * LAMBDA_1 + S2[j] - S[j];
+				L->data[i_p][0] = (S_OBS[j]->L1 - S_STA[j]->L1) * LAMBDA_1 + S2[j] - S[j];
 
 				A->data[i_c][0] = -DX0[j] / S[j];
 				A->data[i_c][1] = -DY0[j] / S[j];
@@ -733,7 +763,6 @@ bool slsq_solve()
 				A->data[i_p][0] = -DX0[j] / S[j];
 				A->data[i_p][1] = -DY0[j] / S[j];
 				A->data[i_p][2] = -DZ0[j] / S[j];
-				//A->data[i_p][j + 3] = LAMBDA_1;
 			}
 		else {
 			for (int j = 0; j < sat_num; j++)
@@ -779,24 +808,100 @@ bool slsq_solve()
 
 		SLS(L, A, Cl, δ, Q);
 
-		if (USING == CODE_PHASE)
+		if (USING == CODE_PHASE) {
 			for (int j = 0; j < sat_num - 1; j++)
 			{
 				ambiguity[prn_table[j] - 1] += δ->data[j + 3][0];
 				Q->data[j + 3][j + 3] += SLSQ_SYS_NOI;
 			}
+			
+			Matrix * temp1 = NULL, *temp2 = NULL, *temp3 = NULL, *temp4 = NULL, *temp5 = NULL;
+			Matrix * temp6 = NULL;
+			Matrix * temp7 = NULL, *temp8 = NULL, *temp9 = NULL, *temp10 = NULL, *cx = NULL;
+
+			mat_multiply(A, δ, temp1);
+			mat_minus(L, temp1, temp2);
+			mat_trans(temp2, temp3);
+			mat_inv(Cl, temp4);
+			mat_multiply(temp3, temp4, temp5);
+			mat_multiply(temp5, temp2, temp6);
+			sos_res_mag = temp6->data[0][0];
+
+			if (!sos_lock_flag) {
+				goto skip;
+			}
+			
+			if (!sos_conv_flag)
+				for (int i = 0; i < sat_num - 1; i++)
+					sos_center_amb[i] = (int)round(ambiguity[prn_table[i] - 1]);
+
+			sos_conv_flag = true;
+			sigma_hat = sos_res_mag / (sat_num - 4);
+			
+			mat_trans(A, temp7);
+			mat_multiply(temp7, temp4, temp8);
+			mat_multiply(temp8, A, temp9);
+			mat_inv(temp9, temp10);
+			mat_multiply(temp10, sigma_hat, cx);
+
+
+			for (int i = 0; i < sat_num - 1; i++)
+			{
+				double float_n = ambiguity[prn_table[i] - 1];
+				int center_n = sos_center_amb[i];
+				double cninv = 1 / cx->data[i + 3][i + 3];
+
+				sos_omega[i][SOS_EDGE] += (cninv * (float_n - center_n) * (float_n - center_n));
+
+				for (int j = 1; j <= SOS_EDGE; j++)
+				{
+					double large = float_n - (center_n + j);
+					double small = float_n - (center_n - j);
+					sos_omega[i][SOS_EDGE + j] += (cninv * large *large);
+					sos_omega[i][SOS_EDGE - j] += (cninv * small *small);
+				}
+			}
+
+		skip:;
+			free_mat(temp1); free_mat(temp2); free_mat(temp3);
+			free_mat(temp4); free_mat(temp5); free_mat(temp6);
+			free_mat(temp7); free_mat(temp8); free_mat(temp9); 
+			free_mat(temp10); free_mat(cx);
+			
+		}
 
 		for (int j = 0; j < 3; j++) {
-			solution[j] = solution[j] + δ->data[j][0];
+			solution[j] = station_xyz[j] + δ->data[j][0];
 			Q->data[j][j] += SLSQ_SYS_NOI;
 		}
-		//mat_output(Q, "Q");
+
+
 	}
 	free_mat(L); free_mat(A); free_mat(Cl);
 	free_mat(r); free_mat(δ);
 	free_mat(Cx);
 	return true;
 }
+
+
+
+void check_sos()
+{
+	for (int i = 0; i < sat_num - 1; i++)
+	{
+		double min = 0;
+		double min2 = 0;
+		int min_index = 0;
+		int min2_index = 0;
+		find_min(sos_omega[i], SOS_BINS, min_index, min);
+		find_min(sos_omega[i], SOS_BINS, min2_index, min2, min_index);
+
+		sos_ratio[i] = min2 / min;
+		sos_fixed[i] = sos_ratio[i] > SOS_THRES;
+	}
+	return;
+}
+
 FILE * ccsl;
 FILE * ccsl2;
 FILE * outfp;
@@ -843,7 +948,7 @@ void check_observation()
 	_fcloseall();
 }
 
-void solve()
+void solve_float()
 {
 	ofp = fopen(OBS_FILE, "rb");
 	nfp = fopen(SAT_FILE, "rb");
@@ -864,11 +969,16 @@ void solve()
 
 		if (OBS->Time >= sigment.start_time && OBS->Time <= sigment.last_for + sigment.start_time)
 		{
+			if (current_time - sigment.start_time >= 900)
+				sos_lock_flag = true;
+
 			fetch_ref_sat(REF_PRN);
 			if (METHOD == SLSQ)
 				slsq_solve();
 			else if (METHOD == EKF)
 				ekf_solve();
+			if(sos_lock_flag)
+				check_sos();
 			output_2();
 		}
 		overall_reset();
@@ -886,5 +996,5 @@ int main()
 	outfp = fopen("out.txt", "w");
 	find_perfect_sigment();
 
-	solve();
+	solve_float();
 }
