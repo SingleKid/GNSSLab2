@@ -253,15 +253,15 @@ void mat_save(Matrix * m, const char * filename)
 	}
 	fclose(fp);
 }
-void SLS(Matrix * Z, Matrix * h, Matrix * D, Matrix *& X, Matrix *& Q)
+void SLS(Matrix * Z, Matrix * h, Matrix * D, Matrix *& X, Matrix *& Qinv, Matrix *& Q)
 {
-	Matrix * K = NULL, *Qinv = NULL, *dz = NULL, *newQ = NULL, *w = NULL, *ht = NULL;
+	Matrix * K = NULL, *dz = NULL, *w = NULL, *ht = NULL;
 	Matrix * temp1 = NULL, *temp2 = NULL, *temp3 = NULL;
 	Matrix * temp4 = NULL, *temp5 = NULL, *temp6 = NULL;
 	Matrix * Zp = NULL, *newX = NULL;
 
-	if (Q != NULL) mat_inv(Q, Qinv);
-	else Qinv = malloc_mat(X->rows, X->rows);
+	if (!Qinv) Qinv = malloc_mat(X->rows, X->rows);
+	
 	mat_inv(D, w);
 	mat_trans(h, ht);
 
@@ -272,10 +272,10 @@ void SLS(Matrix * Z, Matrix * h, Matrix * D, Matrix *& X, Matrix *& Q)
 	////for Q-1
 	mat_addition(Qinv, temp2, temp3);
 	//// done Q
-	mat_inv(temp3, newQ);
+	mat_inv(temp3, Q);
 
 	// for K = Qhtw
-	mat_multiply(newQ, ht, temp4);
+	mat_multiply(Q, ht, temp4);
 	mat_multiply(temp4, w, K);
 
 	// for dz = z - hX
@@ -288,14 +288,14 @@ void SLS(Matrix * Z, Matrix * h, Matrix * D, Matrix *& X, Matrix *& Q)
 
 	// outputs
 	free_mat(X);
-	free_mat(Q);
 	X = newX;
-	Q = newQ;
+	free_mat(Qinv);
+	Qinv = temp3;
 
 	// frees
-	free_mat(temp1); free_mat(temp2); free_mat(temp3);
+	free_mat(temp1); free_mat(temp2); 
 	free_mat(temp4); free_mat(temp5); free_mat(temp6);
-	free_mat(K); free_mat(Qinv); free_mat(K);
+	free_mat(K); free_mat(K);
 	free_mat(dz); free_mat(w); free_mat(ht);
 }
 

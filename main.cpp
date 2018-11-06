@@ -15,7 +15,8 @@ enum USING_OBS {
 };
 const SOLVE_METHOD METHOD = SLSQ;
 USING_OBS USING = CODE_PHASE;
-#define REF_PRN 17
+#define REF_PRN 28
+#define PAUSE_EPOCH 4000
 
 
 // PROGRAM LEVEL
@@ -49,20 +50,21 @@ const double base_xyz[3]{ -1625352.17084393, -3653483.75114927, 4953733.86925805
 #define OUTLIER_THRES 20 // meters
 
 // ESTIMATOR PARAMETERS
-#define CODE_SIGMA0 1
-#define PHASE_SIGMA0 0.01
+#define CODE_SIGMA0 2
+#define PHASE_SIGMA0 0.02
 // SLSQ
-#define SLSQ_SYS_NOI 1e-5
+#define SLSQ_SYS_NOI 0.00001
+#define FIXED_SYS_NOI 0.001
 // EKF
 #define EKF_SYS_NOI 0.1
 #define FIRST_OBS_NOI 6e6
 #define EKF_INTERVAL 1
 
 // SOS PARAMETERS
-#define SOS_EDGE 10
-const int SOS_BINS = SOS_EDGE * 2 + 1;
 #define SOS_THRES 3
+#define SEARCH_SPACE_CONST 3.5
 #define SOS_VALID_RES 0.50
+#define SOS_START 1400
 
 // GPS LEVEL
 #define LAMBDA_1 0.190293672798365
@@ -212,22 +214,32 @@ Matrix * D = NULL;
 int prn_table[GPS_SAT_NUM];
 // SLSQ
 Matrix * Q = NULL;
+Matrix * Qinv = NULL;
 // EKF
 gnss_ekf ekf;
 
 // SOS LEVEL
+const int ref_amb[CHANNEL_NUM] = { 1, -12, -1, -10, -9, -20, -13, 8, -2 };
 double sos_res_mag = 0;
 double sigma_hat = 0;
-double sos_omega[GPS_SAT_NUM][SOS_EDGE * 2 + 1] = { {0} };
-double sos_ratio[GPS_SAT_NUM] = { 0 };
-bool sos_fixed[GPS_SAT_NUM] = { false };
-bool sos_lock_flag = false;
-bool sos_conv_flag = false;
-int sos_center_amb[GPS_SAT_NUM] = { 0 };
+int search_diameter[CHANNEL_NUM] = { 0 };
+int int_n_essemble[CHANNEL_NUM + 1] = { 0 };
+int ** possible_n;
+int sos_search_num = 0;
+bool sos_open = false;
+Matrix ** int_n = NULL;
+double * sos_omega = NULL;
+int min_index = 0;
+double sos_ratio = 0;
+bool sos_fixed = false;
+Matrix * cx = NULL;
+Matrix * cn = NULL;
+Matrix * n  = NULL;
 
 // ANALYZE LEVEL
 double phase_rate_value_1[GPS_SAT_NUM];
 double phase_rate_value_2[GPS_SAT_NUM];
+
 
 void append_history(SAT_EVENT e, int sn)
 {
@@ -504,7 +516,7 @@ void overall_reset()
 	memset(phase_rate_value_1, 0, sizeof(double) * GPS_SAT_NUM);
 	memset(phase_rate_value_2, 0, sizeof(double) * GPS_SAT_NUM);
 	memset(sat_elev, 0, sizeof(double) * GPS_SAT_NUM);
-	memset(prn_table, 0, sizeof(int) * GPS_SAT_NUM);
+	//memset(prn_table, 0, sizeof(int) * GPS_SAT_NUM);
 
 	memcpy(P_OBS, OBS, sizeof(obs_epoch) * CHANNEL_NUM);
 	memcpy(P_SAT, SAT, sizeof(sat_epoch) * CHANNEL_NUM);
@@ -666,6 +678,7 @@ next:;
 	int row = 0, col = 0;
 	switch (USING) {
 	case CODE_ONLY:
+	case PHASE_ONLY:
 		row = sat_num - 1;
 		col = sat_num;
 		D = malloc_mat(row, col);
@@ -705,6 +718,7 @@ bool slsq_solve()
 	switch (USING)
 	{
 	case CODE_ONLY:
+	case PHASE_ONLY:
 		L = malloc_mat(sat_num, 1);
 		A = malloc_mat(sat_num, 3);
 		Cl = malloc_mat(sat_num, sat_num);
@@ -764,7 +778,7 @@ bool slsq_solve()
 				A->data[i_p][1] = -DY0[j] / S[j];
 				A->data[i_p][2] = -DZ0[j] / S[j];
 			}
-		else {
+		else if(USING == CODE_ONLY)
 			for (int j = 0; j < sat_num; j++)
 			{
 				double sinE = sin(sat_elev[(int)(S_SAT[j]->PRN - 1)]);
@@ -774,8 +788,16 @@ bool slsq_solve()
 				A->data[j][1] = -DY0[j] / S[j];
 				A->data[j][2] = -DZ0[j] / S[j];
 			}
-		}
-
+		else if (USING == PHASE_ONLY)
+			for (int j = 0; j < sat_num; j++)
+			{
+				double sinE = sin(sat_elev[(int)(S_SAT[j]->PRN - 1)]);
+				Cl->data[j][j] = PHASE_SIGMA0 * PHASE_SIGMA0 / sinE / sinE;
+				L->data[j][0] = (S_OBS[j]->L1 - S_STA[j]->L1) * LAMBDA_1 + S2[j] - S[j];
+				A->data[j][0] = -DX0[j] / S[j];
+				A->data[j][1] = -DY0[j] / S[j];
+				A->data[j][2] = -DZ0[j] / S[j];
+			}
 
 
 		Matrix * La = L;
@@ -805,76 +827,92 @@ bool slsq_solve()
 				A->data[i_p][i + 3] = LAMBDA_1;
 				L->data[i_p][0] -= ambiguity[prn_table[i] - 1] * LAMBDA_1;
 			}
+		else if (USING == PHASE_ONLY)
+			for (int i = 0; i < sat_num - 1; i++)
+				L->data[i][0] -= ambiguity[prn_table[i] - 1] * LAMBDA_1;
 
-		SLS(L, A, Cl, δ, Q);
+		SLS(L, A, Cl, δ, Qinv, Q);
+
+		Matrix * temp1 = NULL, *temp2 = NULL, *temp3 = NULL, *temp4 = NULL, *temp5 = NULL;
+		Matrix * temp6 = NULL;
+		Matrix * temp7 = NULL, *temp8 = NULL, *temp9 = NULL, *temp10 = NULL, * temp11 = NULL;
+		Matrix * temp12 = NULL, *temp13 = NULL, *cn_inv = NULL;
+		free_mat(cx); free_mat(cn);
+
+		mat_multiply(A, δ, temp1);
+		mat_minus(L, temp1, temp2);
+		mat_trans(temp2, temp3);
+		mat_inv(Cl, temp4);
+		mat_multiply(temp3, temp4, temp5);
+		mat_multiply(temp5, temp2, temp6);
+		sos_res_mag = temp6->data[0][0];
+
+		sigma_hat = sos_res_mag / (sat_num - 4);
+		mat_multiply(Q, sigma_hat, cx);
+
+		//sub_mat(Q, 3, sat_num + 1, 3, sat_num + 1, temp7);
+		//sub_mat(temp2, 3, sat_num + 1, 0, 0, temp8);
+		//mat_trans(temp8, temp9);
+		//mat_multiply(temp9, temp4, temp10);
+		//mat_multiply(temp10, temp4, temp11);
+		//mat_multiply(temp7, temp11->data[0][0] / sat_num - 7, cn);
+		
+		//mat_output(cx, "cx");
+
+
+		
+		//cn = malloc_mat(sat_num - 1, sat_num - 1);
+		//for (int i = 0; i < sat_num - 1; i++)
+		//	cn->data[i][i] = cx->data[i + 3][i + 3];
 
 		if (USING == CODE_PHASE) {
+			sub_mat(cx, 3, sat_num + 1, 3, sat_num + 1, cn);
 			for (int j = 0; j < sat_num - 1; j++)
 			{
 				ambiguity[prn_table[j] - 1] += δ->data[j + 3][0];
 				Q->data[j + 3][j + 3] += SLSQ_SYS_NOI;
 			}
-			
-			Matrix * temp1 = NULL, *temp2 = NULL, *temp3 = NULL, *temp4 = NULL, *temp5 = NULL;
-			Matrix * temp6 = NULL;
-			Matrix * temp7 = NULL, *temp8 = NULL, *temp9 = NULL, *temp10 = NULL, *cx = NULL;
+		}
 
-			mat_multiply(A, δ, temp1);
-			mat_minus(L, temp1, temp2);
-			mat_trans(temp2, temp3);
-			mat_inv(Cl, temp4);
-			mat_multiply(temp3, temp4, temp5);
-			mat_multiply(temp5, temp2, temp6);
-			sos_res_mag = temp6->data[0][0];
-
-			if (!sos_lock_flag) {
-				goto skip;
-			}
-			
-			if (!sos_conv_flag)
-				for (int i = 0; i < sat_num - 1; i++)
-					sos_center_amb[i] = (int)round(ambiguity[prn_table[i] - 1]);
-
-			sos_conv_flag = true;
-			sigma_hat = sos_res_mag / (sat_num - 4);
-			
-			mat_trans(A, temp7);
-			mat_multiply(temp7, temp4, temp8);
-			mat_multiply(temp8, A, temp9);
-			mat_inv(temp9, temp10);
-			mat_multiply(temp10, sigma_hat, cx);
-
+		if (sos_open && USING == CODE_PHASE)
+		{
+			Matrix * cn2 = NULL;
+			mat_multiply(cn, 1, cn2);
+			mat_inv(cn2, cn_inv);
 
 			for (int i = 0; i < sat_num - 1; i++)
+				n->data[i][0] = ambiguity[prn_table[i] - 1];
+
+
+			for (int i = 0; i < sos_search_num; i++)
 			{
-				double float_n = ambiguity[prn_table[i] - 1];
-				int center_n = sos_center_amb[i];
-				double cninv = 1 / cx->data[i + 3][i + 3];
-
-				sos_omega[i][SOS_EDGE] += (cninv * (float_n - center_n) * (float_n - center_n));
-
-				for (int j = 1; j <= SOS_EDGE; j++)
-				{
-					double large = float_n - (center_n + j);
-					double small = float_n - (center_n - j);
-					sos_omega[i][SOS_EDGE + j] += (cninv * large *large);
-					sos_omega[i][SOS_EDGE - j] += (cninv * small *small);
-				}
+				Matrix * temp1 = NULL, *temp2 = NULL, *temp3 = NULL, *temp4 = NULL, *temp5 = NULL;
+				
+				mat_minus(n, int_n[i], temp1);
+				mat_trans(temp1, temp2);
+				
+				mat_multiply(temp2, cn_inv, temp4);
+				mat_multiply(temp4, temp1, temp5);
+				/*mat_multiply(temp2, temp1, temp5);*/
+				sos_omega[i] += temp5->data[0][0];
+				free_mat(temp1);
+				free_mat(temp2);
+				free_mat(temp3);
+				free_mat(temp4);
+				free_mat(temp5);
 			}
-
-		skip:;
-			free_mat(temp1); free_mat(temp2); free_mat(temp3);
-			free_mat(temp4); free_mat(temp5); free_mat(temp6);
-			free_mat(temp7); free_mat(temp8); free_mat(temp9); 
-			free_mat(temp10); free_mat(cx);
-			
 		}
-
 		for (int j = 0; j < 3; j++) {
 			solution[j] = station_xyz[j] + δ->data[j][0];
-			Q->data[j][j] += SLSQ_SYS_NOI;
+			Q->data[j][j] += USING == PHASE_ONLY ? FIXED_SYS_NOI : SLSQ_SYS_NOI;
 		}
-
+		mat_inv(Q, Qinv);
+		free_mat(temp1); free_mat(temp2); free_mat(temp3);
+		free_mat(temp4); free_mat(temp5); free_mat(temp6);
+		free_mat(temp7); free_mat(temp8); free_mat(temp9);
+		free_mat(temp10); free_mat(temp11); free_mat(temp12);
+		free_mat(temp13); free_mat(cn_inv);
+		
 
 	}
 	free_mat(L); free_mat(A); free_mat(Cl);
@@ -883,28 +921,95 @@ bool slsq_solve()
 	return true;
 }
 
+void n_enum(int sat_index)
+{
+	if (sat_index == sat_num) {
+		int_n[sos_search_num] = malloc_mat(sat_num - 1, 1);
+		for (int i = 0; i < sat_num - 1; i++)
+			int_n[sos_search_num]->data[i][0] = int_n_essemble[i];
+		//mat_output(int_n[sos_search_num], "int_n");
+		sos_search_num++;
+		return;
+	}
 
+	int possibility = sat_index == sat_num - 1 ? 1 : search_diameter[sat_index];
+	for (int i = 0; i < possibility; i++)
+	{
+		int_n_essemble[sat_index] = possible_n[sat_index][i];
+		n_enum(sat_index + 1);
+	}
+}
+
+void start_sos()
+{
+	printf("==========START SOS PROCESS==========\n");
+	sos_open = true;
+	sos_search_num = 1;
+	possible_n = new int*[sat_num];
+	possible_n[sat_num - 1] = new int[CHANNEL_NUM];
+	int mark = 9;
+	for (int i = 0; i < sat_num - 1; i++)
+	{
+		bool has = false;
+
+		double n = ambiguity[prn_table[i] - 1];
+		double r = sqrt(cn->data[i][i]) * SEARCH_SPACE_CONST;
+		int upper = (int)round(n + r);
+		int litter = (int)round(n - r);
+		possible_n[i] = new int[upper - litter + 1];
+		for (int j = litter; j <= upper; j++) {
+			possible_n[i][j - litter] = j;
+			if (ref_amb[i] == j) has = true;
+			printf("%d,", j);
+		}
+		search_diameter[i] = upper - litter + 1;
+		sos_search_num *= (search_diameter[i]);
+		printf("%s\n", has ? "yes" : "no");
+		if (has)mark--;
+	}
+	printf("remain: %d, space: %d\n", mark, sos_search_num);
+	int_n = new Matrix*[sos_search_num];
+	n = malloc_mat(sat_num - 1, 1);
+	for (int i = 0; i < sat_num - 1; i++)
+		n->data[i][0] = ambiguity[prn_table[i] - 1];
+	sos_omega = new double[sos_search_num];
+	memset(sos_omega, 0, sizeof(double) * sos_search_num);
+
+	sos_search_num = 0;
+	printf("=====================================\n");
+	n_enum(0);
+}
 
 void check_sos()
 {
-	for (int i = 0; i < sat_num - 1; i++)
-	{
-		double min = 0;
-		double min2 = 0;
-		int min_index = 0;
-		int min2_index = 0;
-		find_min(sos_omega[i], SOS_BINS, min_index, min);
-		find_min(sos_omega[i], SOS_BINS, min2_index, min2, min_index);
+	double min = 0;
+	double min2 = 0;
+	
+	int min2_index = 0;
 
-		sos_ratio[i] = min2 / min;
-		sos_fixed[i] = sos_ratio[i] > SOS_THRES;
+	//FILE * fp = fopen("omega.txt", "w");
+	//for (int i = 0; i < sos_search_num; i++)
+	//{
+	//	fprintf(fp, "%.3lf\n", sos_omega[i]);
+	//}
+	//fclose(fp);
+
+	find_min(sos_omega, sos_search_num, min_index, min);
+	find_min(sos_omega, sos_search_num, min2_index, min2, min_index);
+
+	sos_ratio = min2 / min;
+	if (!sos_fixed && sos_ratio > SOS_THRES) {
+		sos_fixed = true;
+		printf("======= SOS ALGORITHM FIXED  ========\n");
+		printf("=====================================\n");
 	}
-	return;
 }
 
 FILE * ccsl;
 FILE * ccsl2;
 FILE * outfp;
+FILE * outfp_f;
+FILE * amb;
 
 void output_1()
 {
@@ -920,12 +1025,24 @@ void output_1()
 void output_2()
 {
 	fprintf(outfp, "%lf\t%lf\t%lf\n", solution[0], solution[1], solution[2]);
+
+	for (int i = 0; i < GPS_SAT_NUM; i++) {
+		fprintf(amb, "%lf\t", ambiguity[i]);
+	}
+	fprintf(amb, "\n");
 }
+
+void output_3()
+{
+	fprintf(outfp_f, "%lf\t%lf\t%lf\n", solution[0], solution[1], solution[2]);
+}
+
 
 void check_observation()
 {
 	ccsl = fopen("ccsl.txt", "w");
 	ccsl2 = fopen("ccsl2.txt", "w");
+	
 	ofp = fopen(OBS_FILE, "rb");
 	nfp = fopen(SAT_FILE, "rb");
 	sfp = fopen(STA_FILE, "rb");
@@ -948,14 +1065,36 @@ void check_observation()
 	_fcloseall();
 }
 
-void solve_float()
+bool fix_n()
 {
+	sat_num = int_n[0]->rows + 1;
+	for (int i = 0; i < sat_num - 1; i++)
+	{
+		if (round(ambiguity[prn_table[i] - 1]) != int_n[min_index]->data[i][0] && int_n[min_index]->data[i][0] != ref_amb[i])
+			return false;
+		
+		ambiguity[prn_table[i] - 1] = int_n[min_index]->data[i][0];
+	}
+	return true;
+}
+
+void solve_fixed()
+{
+	USING = PHASE_ONLY;
+	outfp_f = fopen("outf.txt", "w");
+	if (!fix_n())throw - 1;
+
 	ofp = fopen(OBS_FILE, "rb");
 	nfp = fopen(SAT_FILE, "rb");
 	sfp = fopen(STA_FILE, "rb");
+
 	if (METHOD == EKF)
 		ekf_create(EKF_INTERVAL, sigment.sn);
-	
+	else if (METHOD == SLSQ)
+	{
+		free_mat(Q);
+		free_mat(Qinv);
+	}
 
 	while (!feof(ofp) && !feof(nfp) && !feof(sfp))
 	{
@@ -967,20 +1106,73 @@ void solve_float()
 		inverse_phase(STA);
 		overall_check();
 
-		if (OBS->Time >= sigment.start_time && OBS->Time <= sigment.last_for + sigment.start_time)
+		if (current_time - sigment.start_time == PAUSE_EPOCH)
 		{
-			if (current_time - sigment.start_time >= 900)
-				sos_lock_flag = true;
-
+			int j = 0;
+		}
+		if (OBS->Time >= sigment.start_time && OBS->Time < sigment.last_for + sigment.start_time)
+		{
 			fetch_ref_sat(REF_PRN);
 			if (METHOD == SLSQ)
 				slsq_solve();
 			else if (METHOD == EKF)
 				ekf_solve();
-			if(sos_lock_flag)
+			output_3();
+		}
+		overall_reset();
+	}
+
+	_fcloseall();
+}
+
+void solve_float()
+{
+	outfp = fopen("out.txt", "w");
+	ofp = fopen(OBS_FILE, "rb");
+	nfp = fopen(SAT_FILE, "rb");
+	sfp = fopen(STA_FILE, "rb");
+	amb = fopen("amb.txt", "w");
+	if (METHOD == EKF)
+		ekf_create(EKF_INTERVAL, sigment.sn);
+	else if (METHOD == SLSQ)
+	{
+		free_mat(Q);
+		free_mat(Qinv);
+	}
+
+	while (!feof(ofp) && !feof(nfp) && !feof(sfp))
+	{
+		
+
+		fread(OBS, CHANNEL_NUM, sizeof(obs_epoch), ofp);
+		fread(SAT, CHANNEL_NUM, sizeof(sat_epoch), nfp);
+		fread(STA, CHANNEL_NUM, sizeof(obs_epoch), sfp);
+
+		inverse_phase(OBS);
+		inverse_phase(STA);
+		overall_check();
+
+		if (current_time - sigment.start_time == PAUSE_EPOCH)
+		{
+			int j = 0;
+		}
+		if (OBS->Time >= sigment.start_time && OBS->Time < sigment.last_for + sigment.start_time)
+		{
+			
+			fetch_ref_sat(REF_PRN);
+
+			if (METHOD == SLSQ)
+				slsq_solve();
+			else if (METHOD == EKF)
+				ekf_solve();
+			if(sos_open)
 				check_sos();
 			output_2();
 		}
+
+		if (current_time - sigment.start_time == SOS_START)
+			start_sos();
+
 		overall_reset();
 	}
 
@@ -991,10 +1183,22 @@ int main()
 {
 	if (USING == CODE_ONLY && METHOD == EKF) return 0;
 
+	printf("=====================================\n");
+	printf("====== SEARCHING OBSERVATION  =======\n");
 	check_observation();
-
-	outfp = fopen("out.txt", "w");
+	printf("=====================================\n");
+	printf("========= LOCATING SIGMENT  =========\n");
+	
 	find_perfect_sigment();
-
+	printf("=====================================\n");
+	printf("=========== SOLVING FLOAT ===========\n");
 	solve_float();
+
+	if (sos_fixed)
+	{
+		printf("=========== SOLVING FIXED ===========\n");
+		solve_fixed();
+	}
+	printf("=====================================\n");
+	system("pause");
 }
