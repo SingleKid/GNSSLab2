@@ -16,7 +16,8 @@ enum USING_OBS {
 const SOLVE_METHOD METHOD = SLSQ;
 USING_OBS USING = CODE_PHASE;
 #define REF_PRN 28
-#define PAUSE_EPOCH 4000
+#define WRONG_AMB_PRN 17
+#define PAUSE_EPOCH 2241
 
 
 // PROGRAM LEVEL
@@ -27,8 +28,9 @@ USING_OBS USING = CODE_PHASE;
 // RECIEVER LEVEL
 #define GPS_SAT_NUM 32
 #define CHANNEL_NUM 12
-const double station_xyz[3]{ -1633489.41308729 , -3651627.19449714, 4952481.59981920 };
-const double base_xyz[3]{ -1625352.17084393, -3653483.75114927, 4953733.86925805 };
+
+const double station_xyz[3]{ -1633489.379677252, -3651627.182503625, 4952481.619549180 };
+const double base_xyz[3]{ -1625352.136567826, -3653483.734198109, 4953733.892847151 };
 
 // OBSERVATION EVENTS
 #define SAT_EVENT   unsigned char
@@ -42,19 +44,21 @@ const double base_xyz[3]{ -1625352.17084393, -3653483.75114927, 4953733.86925805
 #define CYCLE_SLIP_2   0b10000000
 
 // CONDITION PARAMETERS
-#define ELEV_THRES 0.1
-#define ELEV_LOW   0.1
+#define ELEV_THRES 0.10
+#define ELEV_LOW   0.10
 #define CYCSLIP_THRES_1 1 //cy
 #define CYCSLIP_THRES_2 0.2 // m
-#define GDOP_THRES 5
+#define GDOP_THRES 5.0
 #define OUTLIER_THRES 20 // meters
 
 // ESTIMATOR PARAMETERS
-#define CODE_SIGMA0 2
-#define PHASE_SIGMA0 0.02
+#define CODE_SIGMA0 8
+#define PHASE_SIGMA0 0.08
+#define FIXED_SIGMA0 100
+
 // SLSQ
-#define SLSQ_SYS_NOI 0.00001
-#define FIXED_SYS_NOI 0.001
+#define SLSQ_SYS_NOI 0.000000
+#define FIXED_SYS_NOI 0.0
 // EKF
 #define EKF_SYS_NOI 0.1
 #define FIRST_OBS_NOI 6e6
@@ -62,7 +66,7 @@ const double base_xyz[3]{ -1625352.17084393, -3653483.75114927, 4953733.86925805
 
 // SOS PARAMETERS
 #define SOS_THRES 3
-#define SEARCH_SPACE_CONST 3.5
+#define SEARCH_SPACE_CONST 1.5
 #define SOS_VALID_RES 0.50
 #define SOS_START 1400
 
@@ -203,8 +207,8 @@ SAT_EVENT ev;
 // SOLUTION LEVEL
 double sat_elev[GPS_SAT_NUM];
 perfect_segment sigment;
-//double solution[3] = { 0,0,0 };
-double solution[3] = { -1633489.41308729 , -3651627.19449714, 4952481.59981920 };
+double solution[3] = { -1625352.17084393, -3653483.75114927, 4953733.86925805 };
+//double solution[3] = { -1633489.41308729 , -3651627.19449714, 4952481.59981920 };
 
 double ambiguity[GPS_SAT_NUM] = {0};
 // DOUBLE-DIFFER
@@ -239,6 +243,12 @@ Matrix * n  = NULL;
 // ANALYZE LEVEL
 double phase_rate_value_1[GPS_SAT_NUM];
 double phase_rate_value_2[GPS_SAT_NUM];
+double phase_rate_value_3[GPS_SAT_NUM];
+double phase_rate_value_4[GPS_SAT_NUM];
+double phase_example;
+double gdop;
+double pseudorange_outliers[GPS_SAT_NUM];
+double residuals[GPS_SAT_NUM];
 
 
 void append_history(SAT_EVENT e, int sn)
@@ -460,7 +470,7 @@ bool outlier_check()
 		double dis_st = distance(S_SAT[i]->P, station_xyz);
 		double obs = S_OBS[i]->C1 - S_STA[i]->C1;
 		double act = dis_st - dis_ba;
-
+		pseudorange_outliers[(int)(S_OBS[i]->PRN - 1)] = fabs(obs - act);
 		if (fabs(obs - act) >= OUTLIER_THRES) 
 			return false;
 	}
@@ -496,13 +506,13 @@ bool dop_check()
 	mat_multiply(At, A, AtA);
 	mat_inv(AtA, Q);
 
-	double GDOP = sqrt(
+	gdop = sqrt(
 		Q->data[0][0] + Q->data[1][1] + Q->data[2][2] + Q->data[3][3]);
 
 	free_mat(A); free_mat(At); free_mat(Q); free_mat(AtA);
-	if (GDOP >= GDOP_THRES) 
+	if (gdop >= GDOP_THRES)
 		return false;
-	return GDOP < GDOP_THRES;
+	return gdop < GDOP_THRES;
 }
 
 void overall_reset()
@@ -510,12 +520,20 @@ void overall_reset()
 	last_sat_num = sat_num;
 	sat_num = 0;
 	ev = 0;
+	gdop = 0;
+
 	memcpy(last_solve_available, solve_available, sizeof(bool) * GPS_SAT_NUM);
 	memset(solve_available, 0, sizeof(bool) * GPS_SAT_NUM);
 
 	memset(phase_rate_value_1, 0, sizeof(double) * GPS_SAT_NUM);
 	memset(phase_rate_value_2, 0, sizeof(double) * GPS_SAT_NUM);
+	memset(phase_rate_value_3, 0, sizeof(double) * GPS_SAT_NUM);
+	memset(phase_rate_value_4, 0, sizeof(double) * GPS_SAT_NUM);
+	memset(residuals, 0, sizeof(double) * GPS_SAT_NUM);
+	memset(pseudorange_outliers, 0, sizeof(double) * GPS_SAT_NUM);
+
 	memset(sat_elev, 0, sizeof(double) * GPS_SAT_NUM);
+
 	//memset(prn_table, 0, sizeof(int) * GPS_SAT_NUM);
 
 	memcpy(P_OBS, OBS, sizeof(obs_epoch) * CHANNEL_NUM);
@@ -558,15 +576,27 @@ bool overall_check()
 													goto next;
 												if( sat_elev[prn - 1] <= ELEV_LOW)
 													ev |= SAT_LOW;
-
+												
 												// cycleslip
 												phase_rate_value_1[prn - 1] = cycle_slip_1(OBS + i, P_OBS + l);
 												phase_rate_value_2[prn - 1] = cycle_slip_2(OBS + i, P_OBS + l);
+												phase_rate_value_3[prn - 1] = cycle_slip_1(STA + k, P_STA + n);
+												phase_rate_value_4[prn - 1] = cycle_slip_2(STA + k, P_STA + n);
+
 												if (phase_rate_value_1[prn - 1] >= CYCSLIP_THRES_1)
 												{
 													ev |= CYCLE_SLIP_1;
 												}
 												if (phase_rate_value_2[prn - 1] >= CYCSLIP_THRES_2)
+												{
+													ev |= CYCLE_SLIP_2;
+												}
+
+												if (phase_rate_value_3[prn - 1] >= CYCSLIP_THRES_1)
+												{
+													ev |= CYCLE_SLIP_1;
+												}
+												if (phase_rate_value_4[prn - 1] >= CYCSLIP_THRES_2)
 												{
 													ev |= CYCLE_SLIP_2;
 												}
@@ -749,9 +779,9 @@ bool slsq_solve()
 	{
 		for (int j = 0; j < sat_num; j++)
 		{
-			DX0[j] = S_SAT[j]->P[0] - station_xyz[0];
-			DY0[j] = S_SAT[j]->P[1] - station_xyz[1];
-			DZ0[j] = S_SAT[j]->P[2] - station_xyz[2];
+			DX0[j] = S_SAT[j]->P[0] - solution[0];
+			DY0[j] = S_SAT[j]->P[1] - solution[1];
+			DZ0[j] = S_SAT[j]->P[2] - solution[2];
 			S[j] = sqrt(DX0[j] * DX0[j] + DY0[j] * DY0[j] + DZ0[j] * DZ0[j]);
 
 			S2[j] = distance(base_xyz, S_SAT[j]->P);
@@ -792,7 +822,7 @@ bool slsq_solve()
 			for (int j = 0; j < sat_num; j++)
 			{
 				double sinE = sin(sat_elev[(int)(S_SAT[j]->PRN - 1)]);
-				Cl->data[j][j] = PHASE_SIGMA0 * PHASE_SIGMA0 / sinE / sinE;
+				Cl->data[j][j] = FIXED_SIGMA0 * PHASE_SIGMA0 * PHASE_SIGMA0 / sinE / sinE;
 				L->data[j][0] = (S_OBS[j]->L1 - S_STA[j]->L1) * LAMBDA_1 + S2[j] - S[j];
 				A->data[j][0] = -DX0[j] / S[j];
 				A->data[j][1] = -DY0[j] / S[j];
@@ -847,8 +877,16 @@ bool slsq_solve()
 		mat_multiply(temp5, temp2, temp6);
 		sos_res_mag = temp6->data[0][0];
 
-		sigma_hat = sos_res_mag / (sat_num - 4);
+		sigma_hat = /*USING == PHASE_ONLY ? sos_res_mag / (sat_num - 4) :*/ 1;//sos_res_mag / (sat_num - 4);
 		mat_multiply(Q, sigma_hat, cx);
+
+		if (USING == PHASE_ONLY)
+		{
+			for (int i = 0; i < sat_num - 1; i++)
+			{
+				residuals[prn_table[i] - 1] = temp2->data[i][0];
+			}
+		}
 
 		//sub_mat(Q, 3, sat_num + 1, 3, sat_num + 1, temp7);
 		//sub_mat(temp2, 3, sat_num + 1, 0, 0, temp8);
@@ -903,7 +941,7 @@ bool slsq_solve()
 			}
 		}
 		for (int j = 0; j < 3; j++) {
-			solution[j] = station_xyz[j] + δ->data[j][0];
+			solution[j] = solution[j] + δ->data[j][0];
 			Q->data[j][j] += USING == PHASE_ONLY ? FIXED_SYS_NOI : SLSQ_SYS_NOI;
 		}
 		mat_inv(Q, Qinv);
@@ -988,15 +1026,12 @@ void check_sos()
 	int min2_index = 0;
 
 	//FILE * fp = fopen("omega.txt", "w");
-	//for (int i = 0; i < sos_search_num; i++)
-	//{
-	//	fprintf(fp, "%.3lf\n", sos_omega[i]);
-	//}
+
 	//fclose(fp);
 
 	find_min(sos_omega, sos_search_num, min_index, min);
 	find_min(sos_omega, sos_search_num, min2_index, min2, min_index);
-
+	
 	sos_ratio = min2 / min;
 	if (!sos_fixed && sos_ratio > SOS_THRES) {
 		sos_fixed = true;
@@ -1007,8 +1042,22 @@ void check_sos()
 
 FILE * ccsl;
 FILE * ccsl2;
+FILE * ccsl3;
+FILE * ccsl4;
+FILE * elevs;
+FILE * outl;
+FILE * gdopf;
+FILE * eve;
+FILE * cxf;
+FILE * omf;
+
+FILE * exam;
 FILE * outfp;
+FILE * outfp_fw;
 FILE * outfp_f;
+FILE * cxff;
+FILE * resif;
+FILE * resifw;
 FILE * amb;
 
 void output_1()
@@ -1017,9 +1066,41 @@ void output_1()
 	{
 		fprintf(ccsl, "%lf\t", phase_rate_value_1[i]);
 		fprintf(ccsl2, "%lf\t", phase_rate_value_2[i]);
+		fprintf(ccsl3, "%lf\t", phase_rate_value_3[i]);
+		fprintf(ccsl4, "%lf\t", phase_rate_value_4[i]);
+		fprintf(elevs, "%lf\t", sat_elev[i]);
+		fprintf(outl, "%lf\t", pseudorange_outliers[i]);
 	}
 	fprintf(ccsl, "\n");
 	fprintf(ccsl2, "\n");
+	fprintf(ccsl3, "\n");
+	fprintf(ccsl4, "\n");
+	fprintf(elevs, "\n");
+	fprintf(outl, "\n");
+
+	fprintf(gdopf, "%lf\n", gdop);
+	
+	static unsigned char and[8]{
+		0b00000001,
+		0b00000010,
+		0b00000100,
+		0b00001000,
+		0b00010000,
+		0b00100000,
+		0b01000000,
+		0b10000000
+	};
+	for (int i = 0; i < 8; i++)
+	{
+		if (ev != 0)
+		{
+			int i = 1;
+		}
+		fprintf(eve, "%d\t", (((ev & and[i]) >> (i)) == 1) ? 1 : 0);
+	}
+	fprintf(eve, "\n");
+
+	fprintf(exam, "%lf\n", OBS[0].L1);
 }
 
 void output_2()
@@ -1029,12 +1110,43 @@ void output_2()
 	for (int i = 0; i < GPS_SAT_NUM; i++) {
 		fprintf(amb, "%lf\t", ambiguity[i]);
 	}
+
+	for (int i = 0; i < sos_search_num; i++)
+	{
+		fprintf(omf, "%lf\t", sos_omega[i]);
+	}
+	fprintf(omf, "\n");
+
+	for (int i = 0; i < cx->rows; i++)
+	{
+		fprintf(cxf, "%lf\t", cx->data[i][i]);
+	}
+	fprintf(cxf, "\n");
+
 	fprintf(amb, "\n");
 }
 
 void output_3()
 {
 	fprintf(outfp_f, "%lf\t%lf\t%lf\n", solution[0], solution[1], solution[2]);
+	for (int i = 0; i < cx->rows; i++)
+	{
+		fprintf(cxff, "%lf\t", cx->data[i][i]);
+	}
+	for (int i = 0; i < GPS_SAT_NUM; i++) {
+		fprintf(resif, "%lf\t", residuals[i]);
+	}
+	fprintf(resif, "\n");
+	fprintf(cxff, "\n");
+}
+
+void output_4()
+{
+	for (int i = 0; i < GPS_SAT_NUM; i++) {
+		fprintf(resifw, "%lf\t", residuals[i]);
+	}
+	fprintf(resifw, "\n");
+	fprintf(outfp_fw, "%lf\t%lf\t%lf\n", solution[0], solution[1], solution[2]);
 }
 
 
@@ -1042,11 +1154,18 @@ void check_observation()
 {
 	ccsl = fopen("ccsl.txt", "w");
 	ccsl2 = fopen("ccsl2.txt", "w");
-	
+	ccsl3 = fopen("ccsl3.txt", "w");
+	ccsl4 = fopen("ccsl4.txt", "w");
+	elevs = fopen("elevs.txt", "w");
+	outl = fopen("outl.txt", "w");
+	exam = fopen("exam.txt", "w");
+	gdopf = fopen("gdopf.txt", "w");
+	eve = fopen("eve.txt", "w");
+
 	ofp = fopen(OBS_FILE, "rb");
 	nfp = fopen(SAT_FILE, "rb");
 	sfp = fopen(STA_FILE, "rb");
-
+	int epoch_num = 1;
 	while (!feof(ofp) && !feof(nfp) && !feof(sfp))
 	{
 		if (!fread(OBS, CHANNEL_NUM, sizeof(obs_epoch), ofp)) break;
@@ -1054,12 +1173,17 @@ void check_observation()
 		if (!fread(STA, CHANNEL_NUM, sizeof(obs_epoch), sfp)) break;
 		inverse_phase(OBS);
 		inverse_phase(STA);
+		if (epoch_num == PAUSE_EPOCH)
+		{
+			int j = 0;
+		}
 		overall_check();
 		append_history(ev, sat_num);
 
 		output_1();
 
 		overall_reset();
+		epoch_num++;
 	}
 
 	_fcloseall();
@@ -1078,10 +1202,65 @@ bool fix_n()
 	return true;
 }
 
+void solve_fixed_wrong()
+{
+	USING = PHASE_ONLY;
+	outfp_fw = fopen("outfw.txt", "w");
+	resifw = fopen("resiw.txt", "w");
+	if (!fix_n())throw - 1;
+
+	// make it wrong
+	ambiguity[WRONG_AMB_PRN - 1] --;
+
+	ofp = fopen(OBS_FILE, "rb");
+	nfp = fopen(SAT_FILE, "rb");
+	sfp = fopen(STA_FILE, "rb");
+	
+
+	if (METHOD == EKF)
+		ekf_create(EKF_INTERVAL, sigment.sn);
+	else if (METHOD == SLSQ)
+	{
+		free_mat(Q);
+		free_mat(Qinv);
+	}
+
+	while (!feof(ofp) && !feof(nfp) && !feof(sfp))
+	{
+		fread(OBS, CHANNEL_NUM, sizeof(obs_epoch), ofp);
+		fread(SAT, CHANNEL_NUM, sizeof(sat_epoch), nfp);
+		fread(STA, CHANNEL_NUM, sizeof(obs_epoch), sfp);
+
+		inverse_phase(OBS);
+		inverse_phase(STA);
+		overall_check();
+
+		if (current_time - sigment.start_time == PAUSE_EPOCH)
+		{
+			int j = 0;
+		}
+		if (OBS->Time >= sigment.start_time && OBS->Time < sigment.last_for + sigment.start_time)
+		{
+			fetch_ref_sat(REF_PRN);
+			if (METHOD == SLSQ)
+				slsq_solve();
+			else if (METHOD == EKF)
+				ekf_solve();
+			output_4();
+		}
+		overall_reset();
+	}
+
+	_fcloseall();
+}
+
 void solve_fixed()
 {
 	USING = PHASE_ONLY;
 	outfp_f = fopen("outf.txt", "w");
+	cxff = fopen("cxff.txt", "w");
+	resif = fopen("resi.txt", "w");
+	
 	if (!fix_n())throw - 1;
 
 	ofp = fopen(OBS_FILE, "rb");
@@ -1131,7 +1310,9 @@ void solve_float()
 	ofp = fopen(OBS_FILE, "rb");
 	nfp = fopen(SAT_FILE, "rb");
 	sfp = fopen(STA_FILE, "rb");
+	omf = fopen("ome.txt", "w");
 	amb = fopen("amb.txt", "w");
+	cxf = fopen("cxf.txt", "w");
 	if (METHOD == EKF)
 		ekf_create(EKF_INTERVAL, sigment.sn);
 	else if (METHOD == SLSQ)
@@ -1198,6 +1379,9 @@ int main()
 	{
 		printf("=========== SOLVING FIXED ===========\n");
 		solve_fixed();
+		printf("=====================================\n");
+		printf("=========== SOLVING WRONG ===========\n");
+		solve_fixed_wrong();
 	}
 	printf("=====================================\n");
 	system("pause");
